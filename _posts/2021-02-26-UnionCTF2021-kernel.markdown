@@ -1,8 +1,8 @@
 ---
-layout: post
+layout: single
 title:  "UnionCTF 2021 Nutty"
 date:   2021-02-26 00:42:22 +0100
-categories: jekyll update
+categories: [cybersecurity]
 ---
 Nutty was a kernel pwn challenge of the UnionCTF 2021. I did not manage to solve the challenge during the CTF but solved it
 afterwards with some help of other solutions.

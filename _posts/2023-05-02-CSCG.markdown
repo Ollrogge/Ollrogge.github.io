@@ -1,6 +1,7 @@
 ---
-layout: post
+layout: single
 title:  "CSCG 2023"
+categories: [cybersecurity]
 ---
 Over the past month, I participated in the qualifying rounds of the [Cyber Security Challenge Germany](https://cscg.de/) (CSCG), which is part of the [European Cyber Security Challenge](https://ecsc.eu/) (ECSC). This CTF event includes two age categories: junior (14-20) and senior (21-25). Participants compete to secure a spot in the German final, with the top 11 players from each age group qualifying. Ultimately, the top 5 players from each age group in the final form a team to represent Germany in the ECSC challenge.
 
