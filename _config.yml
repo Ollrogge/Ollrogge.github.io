@@ -31,7 +31,7 @@ github_username:  Ollrogge
 include: ["_pages"]
 
 # Build settings
-theme: minimal-mistakes-jekyll
+remote_theme: "mmistakes/minimal-mistakes@4.27.3"
 minimal_mistakes_skin: "dark"
 
 author:
@@ -41,9 +41,12 @@ author:
     - label: "GitHub"
       icon: "fab fa-github"
       url: "https://github.com/Ollrogge"
-    - label: "Twitter"
-      icon: "fab fa-twitter"
+    - label: "X"
+      icon: "fa-brands fa-x-twitter"
       url: "https://twitter.com/_h0p5"
+    - label: "LinkedIn"
+      icon: "fab fa-linkedin-in"
+      url: "https://www.linkedin.com/in/nils-ollrogge/"
 
 # Minimal Mistakes defaults for posts
 defaults:
@@ -56,6 +59,8 @@ defaults:
       read_time: true
       share: false
       related: false
+
+plugins: ["jekyll-include-cache"]
 # Exclude from processing.
 # The following items will not be processed, by default.
 # Any item listed under the `exclude:` key here will be automatically added to
@@ -75,3 +80,12 @@ defaults:
 #   - vendor/cache/
 #   - vendor/gems/
 #   - vendor/ruby/
+exclude:
+  - minimal-mistakes
+  - Gemfile
+  - Gemfile.lock
+  - vendor
+  - node_modules
+  - .jekyll-cache
+  - .sass-cache
+  - README.md
